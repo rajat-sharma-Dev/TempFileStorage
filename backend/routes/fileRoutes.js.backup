@@ -1,0 +1,207 @@
+import express from 'express';
+import upload from '../config/upload.js';
+import * as fileModel from '../models/fileModel.js';
+import * as paymentModel from '../models/paymentModel.js';
+import * as transactionModel from '../models/transactionModel.js';
+import { getPriceForDuration, isValidDuration } from '../config/pricing.js';
+import { generateShareLink, calculateExpiryDate, validateFileUpload, isFileExpired } from '../utils/helpers.js';
+import fs from 'fs';
+import path from 'path';
+
+const router = express.Router();
+
+// Upload file endpoint - Protected by x402 protocol
+router.post('/upload', upload.single('file'), async (req, res) => {
+  try {
+    const { duration } = req.body;
+    const file = req.file;
+
+    // Validate file
+    const fileValidation = validateFileUpload(file);
+    if (!fileValidation.valid) {
+      // Delete uploaded file if validation fails
+      if (file && file.path) {
+        fs.unlinkSync(file.path);
+      }
+      return res.status(400).json({ error: fileValidation.error });
+    }
+
+    // Validate duration
+    if (!duration || !isValidDuration(parseInt(duration))) {
+      if (file && file.path) {
+        fs.unlinkSync(file.path);
+      }
+      return res.status(400).json({ 
+        error: 'Invalid duration. Must be 1, 7, or 30 days' 
+      });
+    }
+
+    const durationDays = parseInt(duration);
+    const priceUsd = getPriceForDuration(durationDays);
+
+    // Check for payment proof in headers (x402 protocol)
+    const paymentProof = req.headers['x-payment-proof'];
+    
+    // If no payment proof, return 402 Payment Required with x402 challenge
+    if (!paymentProof) {
+      // Delete uploaded file since payment is required first
+      if (file && file.path) {
+        fs.unlinkSync(file.path);
+      }
+
+      // Generate nonce for payment tracking
+      const nonce = `upload_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+
+      // Return 402 with x402 headers
+      return res.status(402)
+        .set({
+          'WWW-Authenticate': 'X402',
+          'X-Payment-Amount': priceUsd.toString(),
+          'X-Payment-Currency': 'USDC',
+          'X-Payment-Receiver': process.env.RECEIVER_WALLET_ADDRESS,
+          'X-Payment-Network': 'base-sepolia',
+          'X-Payment-Chain-Id': '84532',
+          'X-Payment-Description': `Upload file for ${durationDays} day(s)`,
+          'X-Payment-Nonce': nonce,
+          'X-Payment-Metadata': JSON.stringify({
+            duration: durationDays,
+            filename: file.originalname,
+            size: file.size,
+          }),
+        })
+        .json({
+          error: 'Payment Required',
+          message: 'Please submit payment to upload file',
+          amount: priceUsd,
+          currency: 'USDC',
+        });
+    }
+
+    // Payment proof provided - verify and process upload
+    console.log('Payment proof received:', paymentProof);
+
+    // Generate unique share link
+    const shareLink = generateShareLink();
+
+    // Calculate expiry date
+    const expiryDate = calculateExpiryDate(durationDays);
+
+    // Create file record in database
+    const fileData = {
+      filename: file.filename,
+      originalFilename: file.originalname,
+      filepath: file.path,
+      fileSize: file.size,
+      mimeType: file.mimetype,
+      durationDays,
+      priceUsd,
+      shareLink,
+      expiryDate,
+    };
+
+    const createdFile = await fileModel.createFile(fileData);
+
+    // Create payment record with completed status (payment already made via x402)
+    await paymentModel.createPayment({
+      fileId: createdFile.id,
+      amountUsd: priceUsd,
+      paymentStatus: 'completed',
+      transactionHash: paymentProof, // Store the transaction hash from payment proof
+    });
+
+    // Log transaction
+    await transactionModel.createTransaction({
+      fileId: createdFile.id,
+      eventType: 'file_uploaded',
+      eventData: {
+        filename: file.originalname,
+        size: file.size,
+        duration: durationDays,
+        price: priceUsd,
+        paymentProof: paymentProof,
+      },
+    });
+
+    res.status(201).json({
+      success: true,
+      message: 'File uploaded successfully',
+      data: {
+        fileId: createdFile.id,
+        filename: createdFile.original_filename,
+        size: createdFile.file_size,
+        duration: createdFile.duration_days,
+        price: createdFile.price_usd,
+        shareLink: createdFile.share_link,
+        expiryDate: createdFile.expiry_date,
+        paymentStatus: 'completed',
+      },
+    });
+  } catch (error) {
+    console.error('Error uploading file:', error);
+    
+    // Clean up file if database operation fails
+    if (req.file && req.file.path) {
+      try {
+        fs.unlinkSync(req.file.path);
+      } catch (unlinkError) {
+        console.error('Error deleting file:', unlinkError);
+      }
+    }
+    
+    res.status(500).json({ error: 'Failed to upload file' });
+  }
+});
+
+// Get file info by share link
+router.get('/info/:shareLink', async (req, res) => {
+  try {
+    const { shareLink } = req.params;
+
+    const file = await fileModel.getFileByShareLink(shareLink);
+
+    if (!file) {
+      return res.status(404).json({ error: 'File not found' });
+    }
+
+    // Check if file is expired
+    if (isFileExpired(file.expiry_date)) {
+      return res.status(410).json({ error: 'File has expired' });
+    }
+
+    res.json({
+      success: true,
+      data: {
+        fileId: file.id,
+        filename: file.original_filename,
+        size: file.file_size,
+        mimeType: file.mime_type,
+        duration: file.duration_days,
+        price: file.price_usd,
+        shareLink: file.share_link,
+        expiryDate: file.expiry_date,
+        paymentStatus: file.payment_status,
+        createdAt: file.created_at,
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching file info:', error);
+    res.status(500).json({ error: 'Failed to fetch file info' });
+  }
+});
+
+// Get all files (admin/debug endpoint)
+router.get('/all', async (req, res) => {
+  try {
+    const files = await fileModel.getAllFiles();
+    res.json({
+      success: true,
+      count: files.length,
+      data: files,
+    });
+  } catch (error) {
+    console.error('Error fetching files:', error);
+    res.status(500).json({ error: 'Failed to fetch files' });
+  }
+});
+
+export default router;
