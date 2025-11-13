@@ -16,7 +16,10 @@ const PaymentSuccess = ({ fileData, onRetryPayment }) => {
   const { data: walletClient } = useWalletClient();
   const publicClient = usePublicClient();
 
-  const shareUrl = `${window.location.origin}/download/${fileData.shareLink}`;
+  // Generate backend download URL (not frontend route)
+  const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:5001/api';
+  const backendBaseUrl = API_BASE_URL.replace('/api', ''); // Remove /api suffix
+  const shareUrl = `${backendBaseUrl}/api/download/${fileData.shareLink}`;
 
   // Fetch file info to check if download payment was already made
   useEffect(() => {
